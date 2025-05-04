@@ -1,3 +1,4 @@
 torch
 torchvision
 rsa>=4.9
+cryptography

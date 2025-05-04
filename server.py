@@ -1,7 +1,14 @@
-import socket, threading, pickle, torch, rsa
+import socket, threading, pickle, torch
 from model import ModelArchitecture, initialize_weights
 from utils import receive_data, send_data, log
 import time
+from cryptography.hazmat.primitives.asymmetric import rsa as crypto_rsa
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
+from utils_crypto import aes_decrypt, rsa_decrypt_key
+import torch.nn.functional as F
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
 
 HOST = 'localhost'
 PORT = 8000
@@ -9,6 +16,29 @@ NUM_CLIENTS = 3
 NUM_ROUNDS = 10
 
 clients = []
+
+# --- Evaluate model ---
+def evaluate(model):
+    model.eval()
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
+    ])
+    test_dataset = datasets.MNIST(root='./data', train=False, download=True, transform=transform)
+    test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
+
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for x, y in test_loader:
+            out = model(x)
+            preds = torch.argmax(out, dim=1)
+            correct += (preds == y).sum().item()
+            total += y.size(0)
+
+    acc = 100 * correct / total
+    return acc
+
 
 def client_handler(conn, addr, cid):
     clients.append((cid, conn, addr))
@@ -28,11 +58,20 @@ def listen_for_clients():
 def federated_round(round_num, model):
     log(f"=== ROUND {round_num} STARTED ===")
 
-    public_key, private_key = rsa.newkeys(2048)
+    private_key = crypto_rsa.generate_private_key(
+    public_exponent=65537,
+    key_size=2048,
+    backend=default_backend()
+    )
+    public_key = private_key.public_key()
+    public_key_pem = public_key.public_bytes(
+    encoding=serialization.Encoding.PEM,
+    format=serialization.PublicFormat.SubjectPublicKeyInfo
+)
 
     # Broadcast public key and model
     for cid, conn, _ in clients:
-        payload = {'round': round_num, 'public_key': public_key}
+        payload = {'round': round_num, 'public_key': public_key_pem}
         if round_num == 0:
             payload['model_arch'] = model
         else:
@@ -42,9 +81,15 @@ def federated_round(round_num, model):
     # Collect encrypted updates
     updates = []
     for cid, conn, _ in clients:
-        encrypted_update = receive_data(conn)
-        update_bytes = rsa.decrypt(encrypted_update, private_key)
+        payload = receive_data(conn)
+        rsa_encrypted_key = payload['rsa_key']
+        iv = payload['iv']
+        encrypted_update = payload['data']
+        aes_key = rsa_decrypt_key(rsa_encrypted_key, private_key)
+        update_bytes = aes_decrypt(encrypted_update, aes_key, iv)
+        
         update = pickle.loads(update_bytes)
+        
         updates.append(update)
         log(f"Update received from Client {cid}")
 
@@ -54,7 +99,10 @@ def federated_round(round_num, model):
         global_state[key] = torch.stack([u[key] for u in updates], 0).mean(0)
 
     model.load_state_dict(global_state)
-    log(f"=== ROUND {round_num} COMPLETED AND AGGREGATED ===")
+    # Run evaluation
+    accuracy = evaluate(model)
+    log(f"=== ROUND {round_num} COMPLETED ===")
+    log(f"Global model accuracy on test set: {accuracy:.2f}%")
     return model
 
 def main():

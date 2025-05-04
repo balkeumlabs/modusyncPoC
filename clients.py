@@ -5,6 +5,11 @@ from torch import nn, optim
 from model import ModelArchitecture
 from utils import receive_data, send_data, log
 import torch.nn.functional as F
+from utils_crypto import aes_encrypt, rsa_encrypt_key
+import os
+from cryptography.hazmat.primitives.asymmetric import rsa as crypto_rsa
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
 
 HOST = 'localhost'
 PORT = 8000
@@ -46,7 +51,11 @@ def main():
 
         for round_num in range(10):
             payload = receive_data(s)
-            public_key = payload['public_key']
+            public_key_pem = payload['public_key']
+            public_key = serialization.load_pem_public_key(
+            public_key_pem,
+            backend=default_backend()
+        )
 
             if round_num == 0:
                 model = payload['model_arch']
@@ -56,11 +65,18 @@ def main():
                 log(f"Round {round_num}: Model state received.")
 
             updated_state = train_local(model, loader)
-
+            # Serialize model state dict to bytes
             update_bytes = pickle.dumps(updated_state)
-            encrypted = rsa.encrypt(update_bytes, public_key)
 
-            send_data(s, encrypted)
+            # AES Encryption
+            aes_key = os.urandom(32)  # AES-256
+            iv = os.urandom(16)
+            encrypted_update = aes_encrypt(update_bytes, aes_key, iv)
+            # RSA-encrypt the AES key
+            rsa_encrypted_key = rsa_encrypt_key(aes_key, public_key)
+
+            # Send all three
+            send_data(s, {'rsa_key': rsa_encrypted_key, 'iv': iv, 'data': encrypted_update})
             log(f"Round {round_num}: Update sent.")
 
 if __name__ == "__main__":
