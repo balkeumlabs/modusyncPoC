@@ -1,75 +1,67 @@
-import socket
-import os
-import pickle
-import torch
-import torch.nn.functional as F
-import rsa
-import random
-from torch import nn, optim
-from torchvision import datasets, transforms
+import socket, pickle, torch, rsa, os
 from torch.utils.data import DataLoader, random_split
+from torchvision import datasets, transforms
+from torch import nn, optim
 from model import ModelArchitecture
-from utils import send_data, receive_data, log
+from utils import receive_data, send_data, log
+import torch.nn.functional as F
 
 HOST = 'localhost'
 PORT = 8000
+NUM_CLIENTS = 3
 CLIENT_ID = int(input("Enter Client ID (0/1/2): "))
 
-def load_partition(client_id, num_clients=3):
+def load_partition(client_id):
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.1307,), (0.3081,))
     ])
     train_dataset = datasets.MNIST(root='./data', train=True, download=True, transform=transform)
-    data_len = len(train_dataset) // num_clients
-    return random_split(train_dataset, [data_len] * num_clients)[client_id]
+    length = len(train_dataset) // NUM_CLIENTS
+    partitions = random_split(train_dataset, [length]*NUM_CLIENTS)
+    return partitions[client_id]
 
-def local_train(model, train_loader, epochs=1):
+def train_local(model, dataloader, epochs=1):
     model.train()
-    optimizer = optim.SGD(model.parameters(), lr=0.01)
+    opt = optim.SGD(model.parameters(), lr=0.01)
     for _ in range(epochs):
-        for data, target in train_loader:
-            optimizer.zero_grad()
-            output = model(data)
-            loss = F.cross_entropy(output, target)
+        for x, y in dataloader:
+            opt.zero_grad()
+            out = model(x)
+            loss = F.cross_entropy(out, y)
             loss.backward()
-            optimizer.step()
+            opt.step()
     return model.state_dict()
 
 def main():
-    log(f"Client {CLIENT_ID} starting...")
     if os.path.exists('./data'):
-        for f in os.listdir('./data'):
-            os.remove(os.path.join('./data', f))
-        log("Cleaned previous dataset.")
+        log("Using existing MNIST data.")
 
-    dataset = load_partition(CLIENT_ID)
-    train_loader = DataLoader(dataset, batch_size=32, shuffle=True)
+    partition = load_partition(CLIENT_ID)
+    loader = DataLoader(partition, batch_size=32, shuffle=True)
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.connect((HOST, PORT))
-        log("Connected to server")
+        log(f"Connected to server as Client {CLIENT_ID}")
 
-        # Generate client RSA key
-        client_pub, client_priv = rsa.newkeys(2048)
-        send_data(s, client_pub)
+        for round_num in range(10):
+            payload = receive_data(s)
+            public_key = payload['public_key']
 
-        # Receive model from server
-        model_state = receive_data(s)
-        model = ModelArchitecture()
-        model.load_state_dict(model_state)
+            if round_num == 0:
+                model = payload['model_arch']
+                log(f"Round {round_num}: Genesis model received.")
+            else:
+                model.load_state_dict(payload['model_state'])
+                log(f"Round {round_num}: Model state received.")
 
-        log("Model received. Starting training.")
-        updated_state = local_train(model, train_loader)
+            updated_state = train_local(model, loader)
 
-        # Encrypt update with server's public key (mock)
-        # In real system, server should send its public key; here we simplify
-        server_pub_key = client_pub  # Simulate same key pair
-        update_bytes = pickle.dumps(updated_state)
-        encrypted_update = rsa.encrypt(update_bytes, server_pub_key)
+            update_bytes = pickle.dumps(updated_state)
+            encrypted = rsa.encrypt(update_bytes, public_key)
 
-        send_data(s, encrypted_update)
-        log("Encrypted update sent to server.")
+            send_data(s, encrypted)
+            log(f"Round {round_num}: Update sent.")
 
 if __name__ == "__main__":
     main()
